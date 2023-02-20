@@ -3,6 +3,7 @@ package auth
 import (
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -13,7 +14,11 @@ import (
 	"github.com/spy16/pgbase/strutils"
 )
 
-const redirectToParam = "redirect_to"
+const (
+	redirectToParam = "redirect_to"
+
+	contentTypeForm = "application/x-www-form-urlencoded"
+)
 
 // Routes installs auth module routes onto the given router.
 func (auth *Auth) Routes(r chi.Router) {
@@ -32,157 +37,160 @@ func (auth *Auth) Routes(r chi.Router) {
 }
 
 func (auth *Auth) handleRegister(w http.ResponseWriter, r *http.Request) {
-	var creds userCreds
-	if err := creds.readFrom(r); err != nil {
-		respond(w, r, 0, err)
-		return
-	} else if !strutils.IsValidEmail(creds.Email) {
-		respond(w, r, 0, errors.MissingAuth.Hintf("invalid email"))
-		return
-	}
-
-	pwdHash, err := HashPassword(creds.Password)
-	if err != nil {
-		respond(w, r, 0, err)
-		return
-	}
-
-	u := NewUser(creds.Kind, creds.Username, creds.Email)
-	u.PwdHash = &pwdHash
-
-	registeredU, err := auth.RegisterUser(r.Context(), u, nil)
-	if err != nil {
-		if errors.OneOf(err, []error{errors.Conflict, errors.InvalidInput}) {
-			respond(w, r, 0, err)
-			return
+	doRegister := func() (*User, error) {
+		var creds userCreds
+		if err := creds.readFrom(r); err != nil {
+			return nil, err
+		} else if !strutils.IsValidEmail(creds.Email) {
+			return nil, errors.MissingAuth.Hintf("invalid email")
 		}
-		respond(w, r, 0, errors.InternalIssue.CausedBy(err))
-		return
+
+		pwdHash, err := HashPassword(creds.Password)
+		if err != nil {
+			return nil, err
+		}
+
+		u := NewUser(creds.Kind, creds.Username, creds.Email)
+		u.PwdHash = &pwdHash
+
+		registeredU, err := auth.RegisterUser(r.Context(), u, nil)
+		if err != nil {
+			if errors.OneOf(err, []error{errors.Conflict, errors.InvalidInput}) {
+				return nil, err
+			}
+			return nil, errors.InternalIssue.CausedBy(err)
+		}
+		return registeredU, nil
 	}
 
-	respond(w, r, http.StatusCreated, registeredU.Clone(true))
+	u, err := doRegister()
+	if err != nil {
+		writeErr(w, r, auth.cfg.RegisterPageRoute, err)
+	} else {
+		writeSuccess(w, r, auth.cfg.RegisterPageRoute, http.StatusCreated, u.Clone(true))
+	}
 }
 
 func (auth *Auth) handleOAuth2Redirect(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	userKind := q.Get("kind")
-	providerID := q.Get("p")
+	prepareRedirection := func() (string, *oauth2FlowState, error) {
+		q := r.URL.Query()
+		userKind := q.Get("kind")
+		providerID := q.Get("p")
+		if userKind == "" {
+			userKind = defaultUserKind
+		}
+		if !strutils.OneOf(userKind, auth.cfg.EnabledKinds) {
+			return "", nil, errors.InvalidInput.Coded("invalid_kind").Hintf("user kind '%s' is not valid", userKind)
+		}
 
-	if userKind == "" {
-		userKind = defaultUserKind
-	}
-	if !strutils.OneOf(userKind, auth.cfg.EnabledKinds) {
-		respond(w, r, 0,
-			errors.InvalidInput.Coded("invalid_kind").Hintf("user kind '%s' is not valid", userKind))
-		return
+		p, err := goth.GetProvider(providerID)
+		if err != nil {
+			return "", nil, errors.InvalidInput.Coded("invalid_provider").CausedBy(err)
+		}
+		state := strutils.RandStr(10)
+
+		sess, err := p.BeginAuth(state)
+		if err != nil {
+			return "", nil, errors.InternalIssue.CausedBy(err)
+		}
+
+		authURL, err := sess.GetAuthURL()
+		if err != nil {
+			return "", nil, errors.InternalIssue.CausedBy(err)
+		}
+
+		return authURL, &oauth2FlowState{
+			UserKind:   userKind,
+			Provider:   p.Name(),
+			Session:    sess.Marshal(),
+			RedirectTo: r.FormValue(redirectToParam),
+		}, nil
 	}
 
-	p, err := goth.GetProvider(providerID)
+	authURL, state, err := prepareRedirection()
 	if err != nil {
-		respond(w, r, 0, errors.InvalidInput.Coded("invalid_provider").CausedBy(err))
+		writeErr(w, r, auth.cfg.LoginPageRoute, err)
 		return
 	}
 
-	state := strutils.RandStr(10)
-
-	sess, err := p.BeginAuth(state)
-	if err != nil {
-		respond(w, r, 0, errors.InternalIssue.CausedBy(err))
-		return
-	}
-
-	authURL, err := sess.GetAuthURL()
-	if err != nil {
-		respond(w, r, 0, errors.InternalIssue.CausedBy(err))
-		return
-	}
-
-	setOAuthFlowState(w, &oauth2FlowState{
-		UserKind:   userKind,
-		Provider:   p.Name(),
-		Session:    sess.Marshal(),
-		RedirectTo: r.FormValue(redirectToParam),
-	})
-
+	setOAuthFlowState(w, state)
 	http.Redirect(w, r, authURL, http.StatusTemporaryRedirect)
 }
 
 func (auth *Auth) handleOAuth2Callback(w http.ResponseWriter, r *http.Request) {
 	var errInvalidCB = errors.InvalidInput.Coded("invalid_callback")
 
-	flowState := popOAuthState(w, r)
-	if flowState == nil {
-		respond(w, r, 0, errInvalidCB.Hintf("oauth2 flow state is nil"))
-		return
-	}
-	_ = r.ParseForm()
-	r.Form.Set(redirectToParam, flowState.RedirectTo)
-
-	p, err := goth.GetProvider(flowState.Provider)
-	if err != nil {
-		respond(w, r, 0, errInvalidCB.CausedBy(err))
-		return
-	}
-
-	sess, err := p.UnmarshalSession(flowState.Session)
-	if err != nil {
-		respond(w, r, 0, errInvalidCB.CausedBy(err))
-		return
-	}
-
-	q := r.URL.Query()
-	if !checkCallbackState(sess, q.Get("state")) {
-		respond(w, r, 0, errInvalidCB.Hintf("state value mismatch"))
-		return
-	}
-
-	if _, err := sess.Authorize(p, q); err != nil {
-		respond(w, r, 0, errors.InternalIssue.CausedBy(err))
-		return
-	}
-
-	gothUser, err := p.FetchUser(sess)
-	if err != nil {
-		respond(w, r, 0, errors.InternalIssue.CausedBy(err))
-		return
-	}
-
-	loginKeyID := NewAuthKey(gothUser.Provider, gothUser.UserID)
-	exU, err := auth.GetUser(r.Context(), loginKeyID)
-	if err != nil && !errors.Is(err, errors.NotFound) {
-		respond(w, r, 0, errors.InternalIssue.CausedBy(err))
-		return
-	}
-
-	if exU == nil {
-		// new user registration
-		newU := NewUser(flowState.UserKind, "", gothUser.Email)
-		newU.Data = userDataFromGothUser(gothUser)
-
-		loginKey := Key{
-			Key: loginKeyID,
-			Attribs: map[string]any{
-				"user_id":       gothUser.UserID,
-				"expires_at":    gothUser.ExpiresAt.Unix(),
-				"access_token":  gothUser.AccessToken,
-				"refresh_token": gothUser.RefreshToken,
-				"raw_data":      gothUser.RawData,
-			},
+	processCallback := func() (*User, error) {
+		flowState := popOAuthState(w, r)
+		if flowState == nil {
+			return nil, errInvalidCB.Hintf("oauth2 flow state is nil")
 		}
 
-		exU, err = auth.RegisterUser(r.Context(), newU, []Key{loginKey})
+		p, err := goth.GetProvider(flowState.Provider)
 		if err != nil {
-			if !errors.OneOf(err, []error{errors.Conflict}) {
-				err = errors.InternalIssue.CausedBy(err)
-			}
-			respond(w, r, 0, err)
-			return
+			return nil, errInvalidCB.CausedBy(err)
 		}
-	} else {
-		// update existing user
+
+		sess, err := p.UnmarshalSession(flowState.Session)
+		if err != nil {
+			return nil, errInvalidCB.CausedBy(err)
+		}
+
+		q := r.URL.Query()
+		if !checkCallbackState(sess, q.Get("state")) {
+			return nil, errInvalidCB.Hintf("state value mismatch")
+		}
+
+		if _, err := sess.Authorize(p, q); err != nil {
+			return nil, errors.InternalIssue.CausedBy(err)
+		}
+
+		gothUser, err := p.FetchUser(sess)
+		if err != nil {
+			return nil, errors.InternalIssue.CausedBy(err)
+		}
+
+		loginKeyID := NewAuthKey(gothUser.Provider, gothUser.UserID)
+		exU, err := auth.GetUser(r.Context(), loginKeyID)
+		if err != nil && !errors.Is(err, errors.NotFound) {
+			return nil, errors.InternalIssue.CausedBy(err)
+		}
+
+		if exU == nil {
+			// new user registration
+			newU := NewUser(flowState.UserKind, "", gothUser.Email)
+			newU.Data = userDataFromGothUser(gothUser)
+
+			loginKey := Key{
+				Key: loginKeyID,
+				Attribs: map[string]any{
+					"user_id":       gothUser.UserID,
+					"expires_at":    gothUser.ExpiresAt.Unix(),
+					"access_token":  gothUser.AccessToken,
+					"refresh_token": gothUser.RefreshToken,
+					"raw_data":      gothUser.RawData,
+				},
+			}
+
+			exU, err = auth.RegisterUser(r.Context(), newU, []Key{loginKey})
+			if err != nil {
+				if !errors.OneOf(err, []error{errors.Conflict}) {
+					err = errors.InternalIssue.CausedBy(err)
+				}
+				return nil, err
+			}
+		} else {
+			// TODO: update existing user
+		}
+		return exU, nil
 	}
 
-	auth.finishLogin(w, r, *exU)
+	u, err := processCallback()
+	if err != nil {
+		writeErr(w, r, auth.cfg.LoginPageRoute, err)
+		return
+	}
+	auth.finishLogin(w, r, *u)
 }
 
 func (auth *Auth) handleVerify(w http.ResponseWriter, r *http.Request) {
@@ -196,7 +204,7 @@ func (auth *Auth) handleVerify(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, errors.NotFound) {
 			err = errors.MissingAuth
 		}
-		respond(w, r, 0, err)
+		writeErr(w, r, auth.cfg.LoginPageRoute, err)
 		return
 	}
 
@@ -204,34 +212,39 @@ func (auth *Auth) handleVerify(w http.ResponseWriter, r *http.Request) {
 }
 
 func (auth *Auth) handleLogin(w http.ResponseWriter, r *http.Request) {
-	var creds userCreds
-	if err := creds.readFrom(r); err != nil {
-		respond(w, r, 0, err)
-		return
-	}
-
-	keyKind := KeyKindUsername
-	keyValue := creds.Username
-	if creds.Email != "" {
-		keyKind = KeyKindEmail
-		keyValue = creds.Email
-	}
-
-	u, err := auth.GetUser(r.Context(), NewAuthKey(keyKind, keyValue))
-	if err != nil {
-		if errors.Is(err, errors.NotFound) {
-			err = errors.MissingAuth.Hintf("user not found")
+	doLogin := func() (*User, error) {
+		var creds userCreds
+		if err := creds.readFrom(r); err != nil {
+			return nil, err
 		}
-		respond(w, r, 0, err)
-		return
-	} else if !u.CheckPassword(creds.Password) {
-		respond(w, r, 0, errors.MissingAuth.Hintf("password mismatch"))
-		return
-	} else if creds.Email != "" && creds.Email != u.Email {
-		respond(w, r, 0, errors.MissingAuth.Hintf("email mismatch"))
-		return
-	} else if u.Kind != creds.Kind {
-		respond(w, r, 0, errors.MissingAuth.Hintf("user kind mismatch"))
+
+		keyKind := KeyKindUsername
+		keyValue := creds.Username
+		if creds.Email != "" {
+			keyKind = KeyKindEmail
+			keyValue = creds.Email
+		}
+
+		u, err := auth.GetUser(r.Context(), NewAuthKey(keyKind, keyValue))
+		if err != nil {
+			if errors.Is(err, errors.NotFound) {
+				err = errors.MissingAuth.Hintf("user not found")
+			}
+			return nil, err
+		} else if !u.CheckPassword(creds.Password) {
+			return nil, errors.MissingAuth.Hintf("password mismatch")
+		} else if creds.Email != "" && creds.Email != u.Email {
+			return nil, errors.MissingAuth.Hintf("email mismatch")
+		} else if u.Kind != creds.Kind {
+			return nil, errors.MissingAuth.Hintf("user kind mismatch")
+		}
+
+		return u, nil
+	}
+
+	u, err := doLogin()
+	if err != nil {
+		writeErr(w, r, auth.cfg.LoginPageRoute, err)
 		return
 	}
 
@@ -266,14 +279,13 @@ func (auth *Auth) handleLogout(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
-
-	respond(w, r, http.StatusNoContent, nil)
+	http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
 }
 
 func (auth *Auth) finishLogin(w http.ResponseWriter, r *http.Request, user User) {
 	session, err := auth.CreateSession(r.Context(), user)
 	if err != nil {
-		respond(w, r, 0, err)
+		writeErr(w, r, auth.cfg.LoginPageRoute, err)
 		return
 	}
 
@@ -287,37 +299,11 @@ func (auth *Auth) finishLogin(w http.ResponseWriter, r *http.Request, user User)
 		SameSite: http.SameSiteLaxMode,
 	})
 
-	respond(w, r, http.StatusOK, map[string]any{
+	writeSuccess(w, r, auth.cfg.LoginPageRoute, http.StatusOK, map[string]any{
 		"user":   user.Clone(true),
 		"token":  session.Token,
 		"expiry": session.ExpiresAt,
 	})
-}
-
-func respond(w http.ResponseWriter, r *http.Request, status int, val any) {
-	redirectTo := r.FormValue(redirectToParam)
-
-	if redirectTo != "" {
-		u, parseErr := url.Parse(redirectTo)
-		if parseErr == nil {
-			if err, ok := val.(error); ok {
-				e := errors.E(err)
-				q := url.Values{
-					"err_code": {e.Code},
-				}
-				u.RawQuery = q.Encode()
-			}
-			http.Redirect(w, r, u.String(), http.StatusTemporaryRedirect)
-			return
-		}
-	}
-
-	if e, ok := val.(error); ok {
-		httputils.WriteErr(w, r, e)
-	} else {
-		httputils.WriteJSON(w, r, status, val)
-	}
-	return
 }
 
 func userDataFromGothUser(gu goth.User) UserData {
@@ -327,5 +313,30 @@ func userDataFromGothUser(gu goth.User) UserData {
 		"picture":   gu.AvatarURL,
 		"location":  gu.Location,
 		"nick_name": gu.NickName,
+	}
+}
+
+func writeErr(w http.ResponseWriter, r *http.Request, redirectTo string, err error) {
+	isFormSubmit := strings.Contains(r.Header.Get("Content-Type"), contentTypeForm)
+	if isFormSubmit {
+		u, parseErr := url.Parse(redirectTo)
+		if parseErr == nil {
+			q := u.Query()
+			q.Set("err_code", errors.E(err).Code)
+			u.RawQuery = q.Encode()
+			u.JoinPath()
+			http.Redirect(w, r, u.String(), http.StatusSeeOther)
+			return
+		}
+	}
+	httputils.WriteErr(w, r, err)
+}
+
+func writeSuccess(w http.ResponseWriter, r *http.Request, redirectTo string, status int, v any) {
+	isFormSubmit := strings.Contains(r.Header.Get("Content-Type"), contentTypeForm)
+	if isFormSubmit {
+		http.Redirect(w, r, redirectTo, http.StatusSeeOther)
+	} else {
+		httputils.WriteJSON(w, r, status, v)
 	}
 }

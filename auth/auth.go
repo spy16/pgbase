@@ -3,7 +3,7 @@ package auth
 import (
 	"context"
 	_ "embed"
-	"strings"
+	"net/url"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -21,11 +21,16 @@ var schema string
 
 // Init initialises auth module and returns.
 func Init(conn *pgx.Conn, baseURL string, cfg Config) (*Auth, error) {
-	if err := cfg.sanitise(); err != nil {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, errors.InvalidInput.Hintf("invalid baseURL").CausedBy(err)
+	}
+
+	if err := cfg.sanitise(u); err != nil {
 		return nil, err
 	}
 
-	cbURL := strings.TrimSuffix(baseURL, "/") + "/oauth2/cb"
+	cbURL := u.JoinPath("/oauth2/cb").String()
 	goth.UseProviders(
 		google.New(cfg.Google.ClientID, cfg.Google.ClientSecret, cbURL, cfg.Google.Scopes...),
 		github.New(cfg.Github.ClientID, cfg.Github.ClientSecret, cbURL, cfg.Github.Scopes...),
@@ -69,21 +74,29 @@ type OAuthConf struct {
 	ClientSecret string   `mapstructure:"client_secret"`
 }
 
-func (c *Config) sanitise() error {
-	if c.SessionTTL <= 0 {
-		c.SessionTTL = 12 * time.Hour
+func (cfg *Config) sanitise(u *url.URL) error {
+	if cfg.RegisterPageRoute != "" {
+		cfg.RegisterPageRoute = u.JoinPath(cfg.RegisterPageRoute).String()
 	}
 
-	if c.SessionCookie == "" {
-		c.SessionCookie = defaultSessionCookie
+	if cfg.LoginPageRoute != "" {
+		cfg.LoginPageRoute = u.JoinPath(cfg.LoginPageRoute).String()
 	}
 
-	if c.SigningSecret == "" {
+	if cfg.SessionTTL <= 0 {
+		cfg.SessionTTL = 12 * time.Hour
+	}
+
+	if cfg.SessionCookie == "" {
+		cfg.SessionCookie = defaultSessionCookie
+	}
+
+	if cfg.SigningSecret == "" {
 		return errors.InvalidInput.Hintf("signing_secret is required")
 	}
 
-	if len(c.EnabledKinds) == 0 {
-		c.EnabledKinds = []string{defaultUserKind}
+	if len(cfg.EnabledKinds) == 0 {
+		cfg.EnabledKinds = []string{defaultUserKind}
 	}
 
 	return nil
