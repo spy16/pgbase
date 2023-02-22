@@ -10,7 +10,7 @@ import (
 	"github.com/markbates/goth"
 
 	"github.com/spy16/pgbase/errors"
-	"github.com/spy16/pgbase/httputils"
+	"github.com/spy16/pgbase/httpx"
 	"github.com/spy16/pgbase/strutils"
 )
 
@@ -32,7 +32,7 @@ func (auth *Auth) Routes(r chi.Router) {
 	r.Group(func(r chi.Router) {
 		r.Use(auth.Authenticate())
 
-		r.Get("/me", httputils.HandlerFuncE(auth.handleWhoAmI))
+		r.Get("/me", httpx.HandlerFuncE(auth.handleWhoAmI))
 	})
 }
 
@@ -265,7 +265,7 @@ func (auth *Auth) handleWhoAmI(w http.ResponseWriter, r *http.Request) error {
 		return errors.InternalIssue.CausedBy(err)
 	}
 
-	httputils.WriteJSON(w, r, http.StatusOK, u.Clone(true))
+	httpx.WriteJSON(w, r, http.StatusOK, u.Clone(true))
 	return nil
 }
 
@@ -329,7 +329,7 @@ func writeErr(w http.ResponseWriter, r *http.Request, redirectTo string, err err
 			return
 		}
 	}
-	httputils.WriteErr(w, r, err)
+	httpx.WriteErr(w, r, err)
 }
 
 func writeSuccess(w http.ResponseWriter, r *http.Request, redirectTo string, status int, v any) {
@@ -337,6 +337,6 @@ func writeSuccess(w http.ResponseWriter, r *http.Request, redirectTo string, sta
 	if isFormSubmit {
 		http.Redirect(w, r, redirectTo, http.StatusSeeOther)
 	} else {
-		httputils.WriteJSON(w, r, status, v)
+		httpx.WriteJSON(w, r, status, v)
 	}
 }

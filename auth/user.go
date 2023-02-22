@@ -10,7 +10,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/spy16/pgbase/errors"
-	"github.com/spy16/pgbase/httputils"
+	"github.com/spy16/pgbase/httpx"
 	"github.com/spy16/pgbase/strutils"
 )
 
@@ -177,7 +177,7 @@ func (c *userCreds) readFrom(r *http.Request) error {
 			c.Kind = defaultUserKind
 		}
 	} else {
-		if err := httputils.ReadJSON(r, c); err != nil {
+		if err := httpx.ReadJSON(r, c); err != nil {
 			return err
 		}
 	}

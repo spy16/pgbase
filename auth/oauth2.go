@@ -7,7 +7,7 @@ import (
 
 	"github.com/markbates/goth"
 
-	"github.com/spy16/pgbase/httputils"
+	"github.com/spy16/pgbase/httpx"
 )
 
 const (
@@ -35,7 +35,7 @@ func setOAuthFlowState(w http.ResponseWriter, state *oauth2FlowState) {
 	}
 
 	if state != nil {
-		value, err := httputils.MarshalCookie(state)
+		value, err := httpx.MarshalCookie(state)
 		if err != nil {
 			panic(err)
 		}
@@ -50,7 +50,7 @@ func popOAuthState(w http.ResponseWriter, r *http.Request) *oauth2FlowState {
 	defer setOAuthFlowState(w, nil)
 
 	var st oauth2FlowState
-	if !httputils.UnmarshalCookie(r, oauthFlowCookie, &st) {
+	if !httpx.UnmarshalCookie(r, oauthFlowCookie, &st) {
 		return nil
 	}
 	return &st

@@ -10,7 +10,7 @@ import (
 	"github.com/golang-jwt/jwt/v4"
 
 	"github.com/spy16/pgbase/errors"
-	"github.com/spy16/pgbase/httputils"
+	"github.com/spy16/pgbase/httpx"
 	"github.com/spy16/pgbase/strutils"
 )
 
@@ -84,7 +84,7 @@ func (auth *Auth) RestoreSession(_ context.Context, token string) (*Session, err
 // requests and inject the user into context.
 func (auth *Auth) Authenticate() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
-		return httputils.HandlerFuncE(func(w http.ResponseWriter, r *http.Request) error {
+		return httpx.HandlerFuncE(func(w http.ResponseWriter, r *http.Request) error {
 			ctx := r.Context()
 
 			token := extractToken(r, auth.cfg.SessionCookie)
