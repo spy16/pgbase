@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/spf13/cobra"
 
 	"github.com/spy16/pgbase/config"
@@ -16,7 +17,8 @@ type App struct {
 	Short   string
 	Version string
 	CfgPtr  any
-	Router  http.Handler
+	Static  http.Handler
+	Routes  func(r chi.Router) error
 }
 
 func (app *App) Run(ctx context.Context) int {
